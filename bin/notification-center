@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+umask 077
+
+state_home=${XDG_STATE_HOME:-$HOME/.local/state}
+
+src_dir=${NC_SRC_DIR:-$state_home/omarchy/notifications}
+src_history=${NC_SRC_HISTORY:-$src_dir/history}
+
+store=${NC_STORE:-$state_home/donovan-notification-center}
+archive="$store/archive.jsonl"
+images="$store/images"
+seen_file="$store/seen"
+lock_file="$store/lock"
+dismissed_file="$store/dismissed"
+cleared_at_file="$store/cleared_at"
+
+keep_days=${NC_KEEP_DAYS:-30}
+max_items=${NC_MAX_ITEMS:-1000}
+previews=${NC_PREVIEWS:-1}
+[[ $keep_days =~ ^[0-9]+$ ]] && (( keep_days >= 1 && keep_days <= 365 )) || keep_days=30
+[[ $max_items =~ ^[0-9]+$ ]] && (( max_items >= 1 && max_items <= 10000 )) || max_items=1000
+[[ $previews == 0 ]] || previews=1
+
+die() {
+  printf '{"ok":false,"error":%s}\n' "$(printf '%s' "$1" | jq -Rs .)"
+  exit 1
+}
+
+command -v jq >/dev/null 2>&1 || die "jq is not installed"
+command -v file >/dev/null 2>&1 || die "file is not installed"
+
+with_lock() {
+  ( exec 9>"$lock_file"; flock 9; "$@" )
+}
+
+ensure_store() {
+  mkdir -p "$store" "$images" || die "cannot create $store"
+  [[ -f $archive ]] || : > "$archive"
+  [[ -f $dismissed_file ]] || : > "$dismissed_file"
+  chmod 700 "$store" "$images" 2>/dev/null || true
+  chmod 600 "$archive" "$dismissed_file" "$seen_file" "$cleared_at_file" 2>/dev/null || true
+}
+
+now_ms() { printf '%s' "$(($(date +%s%N) / 1000000))"; }
+
+
+is_dismissed() {
+  local key=$1
+  [[ -n $key ]] || return 1
+  if [[ -s $dismissed_file ]] && grep -qxF "$key" "$dismissed_file" 2>/dev/null; then
+    return 0
+  fi
+  if [[ -s $cleared_at_file ]]; then
+    local cleared_at stamp
+    cleared_at=$(cat "$cleared_at_file" 2>/dev/null || echo 0)
+    if [[ $cleared_at =~ ^[0-9]+$ ]] && (( cleared_at > 0 )); then
+      stamp=${key%%-*}
+      if [[ $stamp =~ ^[0-9]+$ ]] && (( stamp <= cleared_at )); then
+        return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
+is_path() {
+  case $1 in
+    file:///*|/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+copy_image() {
+  local src=$1 key=$2 slot=$3 dest
+  src=${src#file://}
+  dest="$images/$key-$slot"
+  if [[ ! -f $src ]]; then
+    [[ -f $dest ]] && printf 'file://%s' "$dest" || printf '%s' ""
+    return
+  fi
+  if timeout 5 head -c 5242881 -- "$src" > "$dest.tmp" 2>/dev/null &&
+     (( $(stat -c%s -- "$dest.tmp" 2>/dev/null || echo 0) <= 5242880 )); then
+    if command -v file >/dev/null 2>&1; then
+      case "$(file -bL --mime-type -- "$dest.tmp" 2>/dev/null)" in
+        image/*) ;;
+        *) rm -f -- "$dest.tmp"; printf '%s' ""; return ;;
+      esac
+    fi
+    if [[ $slot == preview ]] && command -v magick >/dev/null 2>&1; then
+      magick "$dest.tmp" -auto-orient -resize '720x720>' -quality 82 "$dest.resized" 2>/dev/null \
+        && mv -f -- "$dest.resized" "$dest.tmp"
+      rm -f -- "$dest.resized"
+    fi
+    mv -f -- "$dest.tmp" "$dest"
+    printf 'file://%s' "$dest"
+  else
+    rm -f -- "$dest.tmp"
+    printf '%s' ""
+  fi
+}
+
+preview_source() {
+  local action=$1
+
+  if [[ $action == \[* ]]; then
+    printf '%s' "$action" | jq -r --arg re '^(file://)?/[^"'"'"'\r\n]*\.(jpe?g|png|webp|gif)$' '
+      if type == "array" then
+        .[] | select(type == "string") | select(test($re; "i"))
+      else empty end
+    ' 2>/dev/null | head -n 1
+    return
+  fi
+
+  printf '%s' "$action" | grep -oiE "(file://)?/[^\"' ]*\.(jpe?g|png|webp|gif)" | head -n 1
+}
+
+ingest_file() {
+  local file=$1 announce_existing=${2:-0}
+  local key entry app_icon image_src exec_src icon_copy image_copy file_src preview_copy
+  key=$(basename -- "$file"); key=${key%.json}
+  [[ $key =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+  if is_dismissed "$key"; then
+    return 0
+  fi
+  [[ -s $file ]] || return 0
+
+  jq -e . "$file" >/dev/null 2>&1 || return 0
+
+  if [[ -s $cleared_at_file ]]; then
+    local cleared_at file_stamp
+    cleared_at=$(cat "$cleared_at_file" 2>/dev/null || echo 0)
+    if [[ $cleared_at =~ ^[0-9]+$ ]] && (( cleared_at > 0 )); then
+      file_stamp=$(jq -r '(.timestamp // 0) | tonumber?' "$file" 2>/dev/null || echo 0)
+      if [[ $file_stamp =~ ^[0-9]+$ ]] && (( file_stamp > 0 && file_stamp <= cleared_at )); then
+        return 0
+      fi
+    fi
+  fi
+
+  local stamp
+  stamp=$(jq -r '.timestamp // 0' "$file")
+  [[ $stamp =~ ^[0-9]+$ ]] || return 0
+  (( stamp >= $(now_ms) - keep_days * 86400000 )) || return 0
+
+  app_icon=$(jq -r '.appIcon // ""' "$file")
+  image_src=$(jq -r '.image // ""' "$file")
+  exec_src=$(jq -r '.execArgv // .exec // ""' "$file")
+
+  icon_copy=$app_icon
+  image_copy=$image_src
+  [[ $app_icon == *://* && $app_icon != file:///* ]] && icon_copy=""
+  [[ $image_src == *://* && $image_src != file:///* ]] && image_copy=""
+  is_path "$app_icon" && icon_copy=$(copy_image "$app_icon" "$key" "appIcon")
+  is_path "$image_src" && image_copy=$(copy_image "$image_src" "$key" "image")
+
+  file_src=$(preview_source "$exec_src")
+  file_src=${file_src#file://}
+
+  preview_copy=""
+  if (( previews )) && [[ -n $file_src ]]; then
+    preview_copy=$(copy_image "$file_src" "$key" "preview")
+  fi
+
+  entry=$(jq -c \
+    --arg key "$key" \
+    --arg appIcon "$icon_copy" \
+    --arg image "$image_copy" \
+    --arg preview "$preview_copy" \
+    --arg file "$file_src" \
+    '{
+       key: $key,
+       app: (.app // ""),
+       appIcon: $appIcon,
+       summary: (.summary // ""),
+       body: (.body // ""),
+       image: $image,
+       preview: $preview,
+       file: $file,
+       glyph: (.glyph // ""),
+       urgency: (.urgency // 1),
+       timestamp: (.timestamp // 0)
+     }
+     | .timestamp = (if .timestamp > 0 then .timestamp
+                     else ((.key | split("-")[0] | tonumber?) // 0) end)' \
+    "$file" 2>/dev/null) || return 0
+  [[ -n $entry ]] || return 0
+
+  local previous
+  previous=$(grep -F "\"key\":\"$key\"" "$archive" 2>/dev/null || true)
+  if [[ $previous == "$entry" ]]; then return 0; fi
+  if [[ -n $previous ]]; then
+    grep -vF "\"key\":\"$key\"" "$archive" > "$archive.tmp" || true
+    mv -f "$archive.tmp" "$archive"
+  fi
+  printf '%s\n' "$entry" >> "$archive"
+  printf '%s\n' "$entry"
+}
+
+sync_all() {
+  local file
+  for file in "$src_history"/*.json "$src_dir"/*.json; do
+    [[ -e $file ]] || continue
+    ingest_file "$file"
+  done
+}
+
+
+prune() {
+  local cutoff kept dropped
+  cutoff=$(( $(now_ms) - keep_days * 86400000 ))
+
+  if [[ -s $cleared_at_file ]]; then
+    local cleared_at
+    cleared_at=$(cat "$cleared_at_file" 2>/dev/null || echo 0)
+    if [[ $cleared_at =~ ^[0-9]+$ ]] && (( cleared_at < cutoff )); then
+      rm -f -- "$cleared_at_file"
+    fi
+  fi
+
+  if [[ -s $dismissed_file ]]; then
+    tail -n 20000 "$dismissed_file" > "$dismissed_file.tmp" 2>/dev/null && mv -f "$dismissed_file.tmp" "$dismissed_file"
+  fi
+
+  [[ -s $archive ]] || return 0
+
+  if ! kept=$(jq -Rc --argjson cutoff "$cutoff" \
+      'fromjson? // empty | select(.timestamp >= $cutoff)' "$archive" 2>/dev/null); then
+    return 0
+  fi
+  kept=$(printf '%s\n' "$kept" | jq -sc --argjson max "$max_items" 'sort_by(.timestamp) | .[-$max:] | .[]')
+
+  dropped=$(comm -23 \
+    <(jq -r '.key' "$archive" 2>/dev/null | sort) \
+    <(printf '%s\n' "$kept" | jq -r 'select(.key) | .key' 2>/dev/null | sort))
+
+  printf '%s\n' "$kept" | grep -v '^$' > "$archive.tmp" || true
+  mv -f "$archive.tmp" "$archive"
+
+  local key
+  while IFS= read -r key; do
+    [[ -n $key ]] || continue
+    rm -f -- "$images/$key-appIcon" "$images/$key-image" "$images/$key-preview"
+  done <<< "$dropped"
+
+
+}
+
+
+quiet=0
+
+sync_and_prune() {
+  if (( quiet )); then
+    sync_all >/dev/null
+  else
+    sync_all
+  fi
+  prune
+}
+
+cmd_sync() {
+  ensure_store
+  with_lock sync_and_prune
+}
+
+cmd_watch() {
+  ensure_store
+  while [[ ! -d $src_dir || ! -d $src_history ]]; do sleep 1; done
+  command -v inotifywait >/dev/null 2>&1 || die "inotifywait is not installed"
+
+  exec 3< <(inotifywait -m -q -e close_write -e moved_to --format '%w%f' \
+    "$src_dir" "$src_history" 2>/dev/null)
+  watcher=$!
+  trap 'kill "$watcher" 2>/dev/null' EXIT
+  trap 'exit 0' INT TERM
+  cmd_sync
+
+  while IFS= read -r file <&3; do
+    [[ $file == *.json ]] || continue
+    with_lock ingest_one "$file"
+  done
+}
+
+ingest_one() {
+  ingest_file "$1" 1
+  prune
+}
+
+cmd_list() {
+  ensure_store
+  local limit=${1:-200}
+  local cleared_at=0
+  if [[ -s $cleared_at_file ]]; then
+    cleared_at=$(cat "$cleared_at_file" 2>/dev/null || echo 0)
+    [[ $cleared_at =~ ^[0-9]+$ ]] || cleared_at=0
+  fi
+
+  [[ $limit =~ ^[0-9]+$ ]] || die "invalid limit"
+  jq -Rsc --argjson cleared "$cleared_at" --argjson limit "$limit" '
+    split("\n") | map(fromjson? | select((.timestamp // 0) > $cleared))
+    | sort_by(.timestamp) | reverse | .[:$limit]
+  ' "$archive"
+
+}
+
+remove_key() {
+  local key=$1
+  [[ -n $key ]] || return 0
+  printf '%s\n' "$key" >> "$dismissed_file"
+  grep -vF "\"key\":\"$key\"" "$archive" > "$archive.tmp" 2>/dev/null || : > "$archive.tmp"
+  mv -f "$archive.tmp" "$archive"
+  rm -f -- "$images/$key-appIcon" "$images/$key-image" "$images/$key-preview"
+}
+
+remove_many() {
+  local key
+  for key in "$@"; do
+    [[ $key =~ ^[A-Za-z0-9_-]+$ ]] || continue
+    remove_key "$key"
+  done
+}
+
+cmd_remove() {
+  ensure_store
+  local key=$1
+  [[ $key =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid notification key"
+  with_lock remove_many "$@"
+  printf '{"ok":true,"removed":%s}\n' "$(printf '%s' "$key" | jq -Rs .)"
+}
+
+clear_all() {
+  local stamp=${1:-$(now_ms)}
+  [[ $stamp =~ ^[0-9]+$ ]] || die "invalid timestamp"
+  printf '%s\n' "$stamp" > "$cleared_at_file"
+}
+
+cmd_clear() {
+  ensure_store
+  with_lock clear_all "$@"
+  printf '{"ok":true,"cleared":true}\n'
+}
+
+cmd_seen() {
+  ensure_store
+  if [[ $# -gt 0 && -n ${1:-} ]]; then
+    printf '%s\n' "$1" > "$seen_file"
+    printf '{"ok":true,"seen":%s}\n' "$1"
+    return
+  fi
+  printf '{"ok":true,"seen":%s}\n' "$(cat "$seen_file" 2>/dev/null || echo 0)"
+}
+
+cmd_unread() {
+  ensure_store
+  local seen
+  seen=$(cat "$seen_file" 2>/dev/null || echo 0)
+  cmd_list "$max_items" | jq --argjson seen "${seen:-0}" '{ok:true,unread:([.[] | select(.timestamp > $seen)] | length)}'
+
+}
+
+case ${1:-} in
+  sync)   shift; quiet=1; cmd_sync; printf '{"ok":true,"synced":true}\n' ;;
+  watch)  shift; cmd_watch ;;
+  list)   shift; ensure_store; with_lock prune; with_lock cmd_list "${1:-1000}" ;;
+  remove) shift; cmd_remove "$@" ;;
+  clear)  shift; cmd_clear "$@" ;;
+  seen)   shift; cmd_seen "$@" ;;
+  unread) shift; cmd_unread ;;
+  prune)  shift; ensure_store; with_lock prune; printf '{"ok":true,"pruned":true}\n' ;;
+  *)
+    cat >&2 <<'USAGE'
+notification-center: the store behind the Omarchy notification center
+
+  watch              follow the notification service and archive what it receives
+  sync               catch up on anything not archived yet
+  list [LIMIT]       the archive as JSON, newest first (default 200)
+  remove KEY         drop one notification
+  clear              drop all of them
+  seen [MS]          read or set when the center was last opened
+  unread             how many arrived since then
+  prune              apply the retention limits now
+USAGE
+    exit 64
+    ;;
+esac
